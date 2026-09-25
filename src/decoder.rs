@@ -9,16 +9,17 @@
 //! in a `CMSampleBuffer` and handed to VideoToolbox.
 //!
 //! VT calls the registered callback with each decoded `CVPixelBuffer`
-//! (NV12 / '420v'). The callback copies the two planes (Y + interleaved
-//! UV) and converts to planar I420 so the rest of oxideav sees
-//! `PixelFormat::Yuv420P` / `VideoFrame`.
+//! (NV12 / '420v'). Decoded buffers are retained as opaque hardware-frame
+//! leases so consumers can import/sample them directly. The compatibility
+//! `materialize()` path locks the buffer and copies/de-interleaves it to I420.
 
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 
 use oxideav_core::{
-    CodecId, CodecParameters, Error, Frame, Packet, Result, VideoFrame, VideoPlane,
+    CodecId, CodecParameters, Error, Frame, FrameLease, HardwareVideoFrame,
+    HardwareVideoFrameStorage, Packet, PixelFormat, Result, VideoFrame, VideoPlane,
 };
 
 use crate::encoder::{build_hw_spec_dict, parse_hardware_mode, vt_error, HardwareMode};
@@ -103,10 +104,155 @@ mod hevc_nal {
     pub const PPS: u8 = 34;
 }
 
+// ─────────────────────────── Decoded buffer lease ─────────────────────────────
+
+/// Retained VideoToolbox decoded frame backed by a CoreVideo CVPixelBuffer.
+///
+/// The pixel buffer remains valid until the last enclosing FrameLease is dropped.
+/// Backend-aware consumers can import `pixel_buffer_ptr()` directly into CoreVideo /
+/// Metal. Generic consumers can call `materialize()` for a CPU I420 copy.
+pub struct VideoToolboxVideoFrameStorage {
+    pixel_buffer: sys::CVPixelBufferRef,
+    width: u32,
+    height: u32,
+    pts: Option<i64>,
+}
+
+unsafe impl Send for VideoToolboxVideoFrameStorage {}
+unsafe impl Sync for VideoToolboxVideoFrameStorage {}
+
+impl VideoToolboxVideoFrameStorage {
+    pub fn pixel_buffer_ptr(&self) -> *mut c_void {
+        self.pixel_buffer
+    }
+}
+
+impl Drop for VideoToolboxVideoFrameStorage {
+    fn drop(&mut self) {
+        if !self.pixel_buffer.is_null() {
+            if let Ok(vt) = sys::vtable() {
+                unsafe { (vt.cf_release)(self.pixel_buffer) };
+            }
+        }
+    }
+}
+
+impl HardwareVideoFrameStorage for VideoToolboxVideoFrameStorage {
+    fn backend(&self) -> &'static str {
+        "videotoolbox"
+    }
+
+    fn width(&self) -> u32 {
+        self.width
+    }
+
+    fn height(&self) -> u32 {
+        self.height
+    }
+
+    fn pixel_format(&self) -> PixelFormat {
+        PixelFormat::Nv12
+    }
+
+    fn pts(&self) -> Option<i64> {
+        self.pts
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn materialize(&self) -> Result<VideoFrame> {
+        materialize_pixel_buffer(self.pixel_buffer, self.width, self.height, self.pts)
+    }
+}
+
+fn materialize_pixel_buffer(
+    pixel_buffer: sys::CVPixelBufferRef,
+    width: u32,
+    height: u32,
+    pts: Option<i64>,
+) -> Result<VideoFrame> {
+    let vt = sys::vtable().map_err(|e| Error::other(format!("videotoolbox: {e}")))?;
+    let ret = unsafe { (vt.cv_pb_lock)(pixel_buffer, K_CV_PIXEL_BUFFER_LOCK_FLAGS_READ_ONLY) };
+    if ret != 0 {
+        return Err(Error::other(format!(
+            "CVPixelBufferLockBaseAddress: {}",
+            sys::describe_os_status(ret)
+        )));
+    }
+
+    let result = (|| {
+        let width = width as usize;
+        let height = height as usize;
+        let chroma_w = width.div_ceil(2);
+        let chroma_h = height.div_ceil(2);
+
+        let y_ptr = unsafe { (vt.cv_pb_get_base_of_plane)(pixel_buffer, 0) } as *const u8;
+        let y_stride = unsafe { (vt.cv_pb_get_bpr_of_plane)(pixel_buffer, 0) };
+        let y_height = unsafe { (vt.cv_pb_get_height_of_plane)(pixel_buffer, 0) };
+        let uv_ptr = unsafe { (vt.cv_pb_get_base_of_plane)(pixel_buffer, 1) } as *const u8;
+        let uv_stride = unsafe { (vt.cv_pb_get_bpr_of_plane)(pixel_buffer, 1) };
+        let uv_height = unsafe { (vt.cv_pb_get_height_of_plane)(pixel_buffer, 1) };
+
+        if y_ptr.is_null() || uv_ptr.is_null() {
+            return Err(Error::invalid(
+                "VideoToolbox CVPixelBuffer is missing an NV12 plane",
+            ));
+        }
+
+        let mut y_data = vec![0u8; width * height];
+        let mut u_data = vec![0u8; chroma_w * chroma_h];
+        let mut v_data = vec![0u8; chroma_w * chroma_h];
+
+        for row in 0..y_height.min(height) {
+            let row_len = width.min(y_stride);
+            let src = unsafe { std::slice::from_raw_parts(y_ptr.add(row * y_stride), row_len) };
+            let dst = row * width;
+            y_data[dst..dst + row_len].copy_from_slice(src);
+        }
+
+        for row in 0..uv_height.min(chroma_h) {
+            let row_len = (chroma_w * 2).min(uv_stride);
+            let src = unsafe { std::slice::from_raw_parts(uv_ptr.add(row * uv_stride), row_len) };
+            let dst = row * chroma_w;
+            for col in 0..chroma_w {
+                u_data[dst + col] = if col * 2 < row_len { src[col * 2] } else { 128 };
+                v_data[dst + col] = if col * 2 + 1 < row_len {
+                    src[col * 2 + 1]
+                } else {
+                    128
+                };
+            }
+        }
+
+        Ok(VideoFrame {
+            pts,
+            planes: vec![
+                VideoPlane {
+                    stride: width,
+                    data: y_data,
+                },
+                VideoPlane {
+                    stride: chroma_w,
+                    data: u_data,
+                },
+                VideoPlane {
+                    stride: chroma_w,
+                    data: v_data,
+                },
+            ],
+        })
+    })();
+
+    unsafe { (vt.cv_pb_unlock)(pixel_buffer, 0) };
+    result
+}
+
 // ─────────────────────────── Callback state ───────────────────────────────────
 
 struct CallbackState {
-    frames: VecDeque<VideoFrame>,
+    frames: VecDeque<FrameLease>,
     error: Option<String>,
 }
 
@@ -154,84 +300,36 @@ unsafe extern "C" fn decomp_callback(
         }
     };
 
-    let ret = unsafe { (vt.cv_pb_lock)(image_buffer, K_CV_PIXEL_BUFFER_LOCK_FLAGS_READ_ONLY) };
-    if ret != 0 {
-        guard.error = Some(format!(
-            "CVPixelBufferLockBaseAddress: {}",
-            sys::describe_os_status(ret)
-        ));
-        return;
-    }
-
     let width = unsafe { (vt.cv_pb_get_width)(image_buffer) };
     let height = unsafe { (vt.cv_pb_get_height)(image_buffer) };
-    let chroma_w = width.div_ceil(2);
-    let chroma_h = height.div_ceil(2);
+    let Ok(width) = u32::try_from(width) else {
+        guard.error = Some("VideoToolbox decoded width exceeds u32".into());
+        return;
+    };
+    let Ok(height) = u32::try_from(height) else {
+        guard.error = Some("VideoToolbox decoded height exceeds u32".into());
+        return;
+    };
 
-    let y_ptr = unsafe { (vt.cv_pb_get_base_of_plane)(image_buffer, 0) } as *const u8;
-    let y_stride = unsafe { (vt.cv_pb_get_bpr_of_plane)(image_buffer, 0) };
-    let y_height = unsafe { (vt.cv_pb_get_height_of_plane)(image_buffer, 0) };
-    let uv_ptr = unsafe { (vt.cv_pb_get_base_of_plane)(image_buffer, 1) } as *const u8;
-    let uv_stride = unsafe { (vt.cv_pb_get_bpr_of_plane)(image_buffer, 1) };
-    let uv_height = unsafe { (vt.cv_pb_get_height_of_plane)(image_buffer, 1) };
-
-    let mut y_data = vec![0u8; width * height];
-    let mut u_data = vec![0u8; chroma_w * chroma_h];
-    let mut v_data = vec![0u8; chroma_w * chroma_h];
-
-    if !y_ptr.is_null() {
-        for row in 0..y_height.min(height) {
-            let row_len = width.min(y_stride);
-            let src = unsafe { std::slice::from_raw_parts(y_ptr.add(row * y_stride), row_len) };
-            let dst = row * width;
-            y_data[dst..dst + row_len].copy_from_slice(src);
-        }
-    }
-
-    if !uv_ptr.is_null() {
-        for row in 0..uv_height.min(chroma_h) {
-            let row_len = (chroma_w * 2).min(uv_stride);
-            let src = unsafe { std::slice::from_raw_parts(uv_ptr.add(row * uv_stride), row_len) };
-            let dst = row * chroma_w;
-            for col in 0..chroma_w {
-                u_data[dst + col] = if col * 2 < row_len { src[col * 2] } else { 128 };
-                v_data[dst + col] = if col * 2 + 1 < row_len {
-                    src[col * 2 + 1]
-                } else {
-                    128
-                };
-            }
-        }
-    }
-
-    unsafe { (vt.cv_pb_unlock)(image_buffer, 0) };
-
-    // Recover the presentation timestamp VT hands back for this frame.
-    // Submission wraps `packet.pts` (or a sequential decode-order counter
-    // when the packet carried none) in a timescale-1 000 000 CMTime, and
-    // VT returns that same time here in presentation order, so `value` is
-    // the caller's own PTS number.
+    // Submission wraps packet PTS in a timescale-1 000 000 CMTime, and VT
+    // returns the same value in presentation order.
     let pts = presentation_time_stamp
         .is_valid()
         .then_some(presentation_time_stamp.value);
 
-    guard.frames.push_back(VideoFrame {
-        pts,
-        planes: vec![
-            VideoPlane {
-                stride: width,
-                data: y_data,
+    // The callback's image_buffer reference is borrowed. Retain it before the
+    // callback returns; VideoToolboxVideoFrameStorage releases it on final drop.
+    unsafe { (vt.cf_retain)(image_buffer) };
+    guard
+        .frames
+        .push_back(FrameLease::from_hardware_video(HardwareVideoFrame::new(
+            VideoToolboxVideoFrameStorage {
+                pixel_buffer: image_buffer,
+                width,
+                height,
+                pts,
             },
-            VideoPlane {
-                stride: chroma_w,
-                data: u_data,
-            },
-            VideoPlane {
-                stride: chroma_w,
-                data: v_data,
-            },
-        ],
-    });
+        )));
 }
 
 // ─────────────────────────── Session creation ─────────────────────────────────
@@ -254,7 +352,6 @@ fn create_vt_session(
     let pixel_fmt_val = K_CV_PIXEL_FORMAT_420_YPCBCRi8_BI_PLANAR_VIDEO_RANGE as i32;
     let pixel_fmt_num = unsafe { sys::cf_number_i32(vt, pixel_fmt_val) };
     let pf_key = unsafe { sys::cf_string(vt, "CVPixelBufferPixelFormatTypeKey") };
-
     let keys: [*const c_void; 1] = [pf_key as *const c_void];
     let vals: [*const c_void; 1] = [pixel_fmt_num as *const c_void];
 
@@ -264,8 +361,8 @@ fn create_vt_session(
             keys.as_ptr(),
             vals.as_ptr(),
             1,
-            std::ptr::null(),
-            std::ptr::null(),
+            vt.cf_type_dict_key_callbacks,
+            vt.cf_type_dict_value_callbacks,
         )
     };
 
@@ -450,7 +547,7 @@ pub struct H264VtDecoder {
     state: Arc<Mutex<CallbackState>>,
     sps_list: Vec<Vec<u8>>,
     pps_list: Vec<Vec<u8>>,
-    output_queue: VecDeque<VideoFrame>,
+    output_queue: VecDeque<FrameLease>,
     pts_counter: i64,
     flushed: bool,
     /// Hardware-acceleration policy from `options["hardware"]`.
@@ -623,8 +720,12 @@ impl oxideav_core::Decoder for H264VtDecoder {
     }
 
     fn receive_frame(&mut self) -> Result<Frame> {
-        if let Some(f) = self.output_queue.pop_front() {
-            return Ok(Frame::Video(f));
+        self.receive_frame_lease()?.into_frame()
+    }
+
+    fn receive_frame_lease(&mut self) -> Result<FrameLease> {
+        if let Some(frame) = self.output_queue.pop_front() {
+            return Ok(frame);
         }
         Err(if self.flushed {
             Error::Eof
@@ -655,7 +756,7 @@ pub struct HevcVtDecoder {
     vps_list: Vec<Vec<u8>>,
     sps_list: Vec<Vec<u8>>,
     pps_list: Vec<Vec<u8>>,
-    output_queue: VecDeque<VideoFrame>,
+    output_queue: VecDeque<FrameLease>,
     pts_counter: i64,
     flushed: bool,
     /// Hardware-acceleration policy from `options["hardware"]`.
@@ -831,8 +932,12 @@ impl oxideav_core::Decoder for HevcVtDecoder {
     }
 
     fn receive_frame(&mut self) -> Result<Frame> {
-        if let Some(f) = self.output_queue.pop_front() {
-            return Ok(Frame::Video(f));
+        self.receive_frame_lease()?.into_frame()
+    }
+
+    fn receive_frame_lease(&mut self) -> Result<FrameLease> {
+        if let Some(frame) = self.output_queue.pop_front() {
+            return Ok(frame);
         }
         Err(if self.flushed {
             Error::Eof
