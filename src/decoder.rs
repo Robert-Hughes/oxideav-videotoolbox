@@ -635,25 +635,38 @@ impl H264VtDecoder {
             }
         }
     }
+
+    fn release_session(&mut self) {
+        if let Ok(vt) = sys::vtable() {
+            if !self.session.is_null() {
+                // A seek starts a new decode epoch. Finish anything VT can
+                // still complete, then invalidate stale reference-picture state.
+                unsafe {
+                    (vt.vt_decomp_finish)(self.session);
+                    (vt.vt_decomp_invalidate)(self.session);
+                    (vt.cf_release)(self.session);
+                }
+                self.session = std::ptr::null_mut();
+            }
+            if !self.fmt_desc.is_null() {
+                unsafe { (vt.cf_release)(self.fmt_desc) };
+                self.fmt_desc = std::ptr::null_mut();
+            }
+        }
+    }
+
+    fn clear_pending_output(&mut self) {
+        self.output_queue.clear();
+        if let Ok(mut state) = self.state.lock() {
+            state.frames.clear();
+            state.error = None;
+        }
+    }
 }
 
 impl Drop for H264VtDecoder {
     fn drop(&mut self) {
-        if let Ok(vt) = sys::vtable() {
-            if !self.session.is_null() {
-                // Per VTDecompressionSession.h: "call
-                // VTDecompressionSessionInvalidate to tear it down and
-                // then CFRelease to release your object reference". The
-                // session is a CF object; invalidating alone leaks it.
-                unsafe {
-                    (vt.vt_decomp_invalidate)(self.session);
-                    (vt.cf_release)(self.session);
-                }
-            }
-            if !self.fmt_desc.is_null() {
-                unsafe { (vt.cf_release)(self.fmt_desc) };
-            }
-        }
+        self.release_session();
     }
 }
 
@@ -680,7 +693,7 @@ impl oxideav_core::Decoder for H264VtDecoder {
         }
 
         let mut vcl_nals: Vec<Vec<u8>> = Vec::new();
-        let mut got_params = false;
+        let mut params_changed = false;
 
         for nal in annex_b_nals(&packet.data) {
             if nal.is_empty() {
@@ -689,20 +702,27 @@ impl oxideav_core::Decoder for H264VtDecoder {
             let nal_type = nal[0] & 0x1F;
             match nal_type {
                 h264_nal::SPS => {
+                    params_changed |=
+                        self.sps_list.len() != 1 || self.sps_list[0].as_slice() != nal;
                     self.sps_list.clear();
                     self.sps_list.push(nal.to_vec());
-                    got_params = true;
                 }
                 h264_nal::PPS => {
+                    params_changed |=
+                        self.pps_list.len() != 1 || self.pps_list[0].as_slice() != nal;
                     self.pps_list.clear();
                     self.pps_list.push(nal.to_vec());
-                    got_params = true;
                 }
                 _ => vcl_nals.push(nal.to_vec()),
             }
         }
 
-        if got_params {
+        if params_changed && !self.session.is_null() {
+            self.release_session();
+            self.clear_pending_output();
+        }
+
+        if !vcl_nals.is_empty() {
             self.ensure_session()?;
         }
 
@@ -742,6 +762,17 @@ impl oxideav_core::Decoder for H264VtDecoder {
         }
         self.pull_frames();
         self.flushed = true;
+        Ok(())
+    }
+
+    fn reset(&mut self) -> Result<()> {
+        // Flush is an end-of-stream drain; a seek starts a new decode epoch.
+        // Retain the parameter sets, but discard the old VT session and all
+        // queued output so reference pictures cannot cross the discontinuity.
+        self.release_session();
+        self.clear_pending_output();
+        self.pts_counter = 0;
+        self.flushed = false;
         Ok(())
     }
 }
@@ -844,23 +875,36 @@ impl HevcVtDecoder {
             }
         }
     }
+
+    fn release_session(&mut self) {
+        if let Ok(vt) = sys::vtable() {
+            if !self.session.is_null() {
+                unsafe {
+                    (vt.vt_decomp_finish)(self.session);
+                    (vt.vt_decomp_invalidate)(self.session);
+                    (vt.cf_release)(self.session);
+                }
+                self.session = std::ptr::null_mut();
+            }
+            if !self.fmt_desc.is_null() {
+                unsafe { (vt.cf_release)(self.fmt_desc) };
+                self.fmt_desc = std::ptr::null_mut();
+            }
+        }
+    }
+
+    fn clear_pending_output(&mut self) {
+        self.output_queue.clear();
+        if let Ok(mut state) = self.state.lock() {
+            state.frames.clear();
+            state.error = None;
+        }
+    }
 }
 
 impl Drop for HevcVtDecoder {
     fn drop(&mut self) {
-        if let Ok(vt) = sys::vtable() {
-            if !self.session.is_null() {
-                // Invalidate, then release the CF object reference (see
-                // the H264VtDecoder Drop for the header contract).
-                unsafe {
-                    (vt.vt_decomp_invalidate)(self.session);
-                    (vt.cf_release)(self.session);
-                }
-            }
-            if !self.fmt_desc.is_null() {
-                unsafe { (vt.cf_release)(self.fmt_desc) };
-            }
-        }
+        self.release_session();
     }
 }
 
@@ -887,7 +931,7 @@ impl oxideav_core::Decoder for HevcVtDecoder {
         }
 
         let mut vcl_nals: Vec<Vec<u8>> = Vec::new();
-        let mut got_params = false;
+        let mut params_changed = false;
 
         for nal in annex_b_nals(&packet.data) {
             if nal.len() < 2 {
@@ -896,25 +940,33 @@ impl oxideav_core::Decoder for HevcVtDecoder {
             let nal_type = (nal[0] >> 1) & 0x3F;
             match nal_type {
                 hevc_nal::VPS => {
+                    params_changed |=
+                        self.vps_list.len() != 1 || self.vps_list[0].as_slice() != nal;
                     self.vps_list.clear();
                     self.vps_list.push(nal.to_vec());
-                    got_params = true;
                 }
                 hevc_nal::SPS => {
+                    params_changed |=
+                        self.sps_list.len() != 1 || self.sps_list[0].as_slice() != nal;
                     self.sps_list.clear();
                     self.sps_list.push(nal.to_vec());
-                    got_params = true;
                 }
                 hevc_nal::PPS => {
+                    params_changed |=
+                        self.pps_list.len() != 1 || self.pps_list[0].as_slice() != nal;
                     self.pps_list.clear();
                     self.pps_list.push(nal.to_vec());
-                    got_params = true;
                 }
                 _ => vcl_nals.push(nal.to_vec()),
             }
         }
 
-        if got_params {
+        if params_changed && !self.session.is_null() {
+            self.release_session();
+            self.clear_pending_output();
+        }
+
+        if !vcl_nals.is_empty() {
             self.ensure_session()?;
         }
 
@@ -954,6 +1006,14 @@ impl oxideav_core::Decoder for HevcVtDecoder {
         }
         self.pull_frames();
         self.flushed = true;
+        Ok(())
+    }
+
+    fn reset(&mut self) -> Result<()> {
+        self.release_session();
+        self.clear_pending_output();
+        self.pts_counter = 0;
+        self.flushed = false;
         Ok(())
     }
 }

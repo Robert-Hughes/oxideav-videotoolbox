@@ -612,6 +612,118 @@ fn session_teardown_stress() {
     }
 }
 
+fn encode_h264_packets(width: usize, height: usize, start_pts: i64) -> Vec<oxideav_core::Packet> {
+    let mut p = CodecParameters::video(CodecId::new("h264"));
+    p.width = Some(width as u32);
+    p.height = Some(height as u32);
+    p.pixel_format = Some(PixelFormat::Yuv420P);
+
+    let mut encoder = vt_encoder::make_h264_encoder(&p).expect("H264 encoder construction");
+    let mut packets = Vec::new();
+    for i in 0..12usize {
+        encoder
+            .send_frame(&Frame::Video(synthetic_frame(
+                width,
+                height,
+                i as u8,
+                start_pts + i as i64 * 3_003,
+            )))
+            .expect("H264 send_frame");
+        loop {
+            match encoder.receive_packet() {
+                Ok(pkt) => packets.push(pkt),
+                Err(Error::NeedMore) => break,
+                Err(e) => panic!("H264 receive_packet error: {e}"),
+            }
+        }
+    }
+    encoder.flush().expect("H264 encoder flush");
+    loop {
+        match encoder.receive_packet() {
+            Ok(pkt) => packets.push(pkt),
+            Err(Error::NeedMore) | Err(Error::Eof) => break,
+            Err(e) => panic!("H264 receive_packet after flush error: {e}"),
+        }
+    }
+    assert!(!packets.is_empty(), "H264 encoder produced no packets");
+    packets
+}
+
+fn feed_h264_packets(
+    decoder: &mut Box<dyn Decoder>,
+    packets: &[oxideav_core::Packet],
+) -> Vec<VideoFrame> {
+    let mut frames = Vec::new();
+    for pkt in packets {
+        decoder.send_packet(pkt).expect("H264 decoder send_packet");
+        loop {
+            match decoder.receive_frame() {
+                Ok(Frame::Video(frame)) => frames.push(frame),
+                Ok(_) => {}
+                Err(Error::NeedMore) | Err(Error::Eof) => break,
+                Err(e) => panic!("H264 receive_frame error: {e}"),
+            }
+        }
+    }
+    frames
+}
+
+#[test]
+fn h264_reset_starts_a_fresh_decode_epoch() {
+    if oxideav_videotoolbox::sys::vtable().is_err() {
+        eprintln!("VideoToolbox unavailable; skipping H264 reset test");
+        return;
+    }
+
+    let width = 320usize;
+    let height = 240usize;
+    let packets = encode_h264_packets(width, height, 90_000);
+
+    let mut p = CodecParameters::video(CodecId::new("h264"));
+    p.width = Some(width as u32);
+    p.height = Some(height as u32);
+    p.pixel_format = Some(PixelFormat::Yuv420P);
+    let mut decoder = vt_decoder::H264VtDecoder::make(&p).expect("decoder construction");
+
+    let first = feed_h264_packets(&mut decoder, &packets);
+    assert!(!first.is_empty(), "first decode epoch produced no frames");
+
+    decoder.reset().expect("VideoToolbox decoder reset");
+
+    let second = feed_h264_packets(&mut decoder, &packets);
+    assert!(
+        !second.is_empty(),
+        "post-reset decode epoch produced no frames"
+    );
+    assert_eq!(second[0].planes[0].stride, width);
+}
+
+#[test]
+fn h264_parameter_change_recreates_videotoolbox_session() {
+    if oxideav_videotoolbox::sys::vtable().is_err() {
+        eprintln!("VideoToolbox unavailable; skipping H264 parameter-change test");
+        return;
+    }
+
+    let first_packets = encode_h264_packets(320, 240, 0);
+    let second_packets = encode_h264_packets(640, 360, 1_000_000);
+
+    let mut p = CodecParameters::video(CodecId::new("h264"));
+    p.width = Some(320);
+    p.height = Some(240);
+    p.pixel_format = Some(PixelFormat::Yuv420P);
+    let mut decoder = vt_decoder::H264VtDecoder::make(&p).expect("decoder construction");
+
+    let first = feed_h264_packets(&mut decoder, &first_packets);
+    assert!(!first.is_empty(), "first format produced no frames");
+    assert_eq!(first[0].planes[0].stride, 320);
+
+    let second = feed_h264_packets(&mut decoder, &second_packets);
+    assert!(!second.is_empty(), "changed format produced no frames");
+    assert_eq!(second[0].planes[0].stride, 640);
+    assert_eq!(second[0].planes[0].data.len() / 640, 360);
+}
+
 #[test]
 fn h264_pts_survival() {
     run_pts_survival("h264");
