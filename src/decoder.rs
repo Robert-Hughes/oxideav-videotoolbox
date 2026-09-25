@@ -256,6 +256,7 @@ fn materialize_pixel_buffer(
 struct CallbackState {
     frames: VecDeque<FrameLease>,
     error: Option<String>,
+    timestamp_num: i64,
 }
 
 impl CallbackState {
@@ -263,6 +264,7 @@ impl CallbackState {
         Arc::new(Mutex::new(Self {
             frames: VecDeque::new(),
             error: None,
+            timestamp_num: 1,
         }))
     }
 }
@@ -313,11 +315,19 @@ unsafe extern "C" fn decomp_callback(
         return;
     };
 
-    // Submission wraps packet PTS in a timescale-1 000 000 CMTime, and VT
-    // returns the same value in presentation order.
-    let pts = presentation_time_stamp
-        .is_valid()
-        .then_some(presentation_time_stamp.value);
+    // Submission represents packet timestamps as CMTime(value=ticks*num,
+    // timescale=den). Convert VideoToolbox's presentation timestamp back to
+    // the packet's original tick domain before exposing it through OxideAV.
+    let pts = if presentation_time_stamp.is_valid() {
+        let num = guard.timestamp_num;
+        if num == 0 {
+            None
+        } else {
+            Some(presentation_time_stamp.value / num)
+        }
+    } else {
+        None
+    };
 
     // The callback's image_buffer reference is borrowed. Retain it before the
     // callback returns; VideoToolboxVideoFrameStorage releases it on final drop.
@@ -411,6 +421,7 @@ fn submit_nal_units(
     vt: &sys::Vtable,
     session: sys::VTDecompressionSessionRef,
     fmt_desc: sys::CMVideoFormatDescriptionRef,
+    state: &Arc<Mutex<CallbackState>>,
     nal_units: &[Vec<u8>],
     packet: &Packet,
     pts_counter: i64,
@@ -478,14 +489,17 @@ fn submit_nal_units(
         return Err(vt_error("CMBlockBufferCreateWithMemoryBlock", status));
     }
 
-    let to_cmtime = |ticks: i64| {
-        CMTime::make(
-            packet
-                .time_base
-                .rescale(ticks, oxideav_core::TimeBase::MICROS),
-            1_000_000,
-        )
-    };
+    let time_num = packet.time_base.num();
+    let time_den = packet.time_base.den();
+    if time_num == 0 || time_den <= 0 || time_den > i32::MAX as i64 {
+        return Err(Error::invalid(format!(
+            "videotoolbox: unsupported packet time base {time_num}/{time_den}"
+        )));
+    }
+    if let Ok(mut callback_state) = state.lock() {
+        callback_state.timestamp_num = time_num;
+    }
+    let to_cmtime = |ticks: i64| CMTime::make(ticks.saturating_mul(time_num), time_den as i32);
     let timing = CMSampleTimingInfo {
         duration: packet.duration.map_or_else(CMTime::invalid, to_cmtime),
         presentation_time_stamp: packet
@@ -707,7 +721,15 @@ impl H264VtDecoder {
         if !vcl_nals.is_empty() && !self.session.is_null() {
             let vt = sys::vtable().map_err(|e| Error::unsupported(format!("videotoolbox: {e}")))?;
             let ctr = self.pts_counter;
-            submit_nal_units(vt, self.session, self.fmt_desc, &vcl_nals, packet, ctr)?;
+            submit_nal_units(
+                vt,
+                self.session,
+                self.fmt_desc,
+                &self.state,
+                &vcl_nals,
+                packet,
+                ctr,
+            )?;
             self.pts_counter += 1;
         }
 
@@ -995,7 +1017,15 @@ impl oxideav_core::Decoder for HevcVtDecoder {
         if !vcl_nals.is_empty() && !self.session.is_null() {
             let vt = sys::vtable().map_err(|e| Error::unsupported(format!("videotoolbox: {e}")))?;
             let ctr = self.pts_counter;
-            submit_nal_units(vt, self.session, self.fmt_desc, &vcl_nals, packet, ctr)?;
+            submit_nal_units(
+                vt,
+                self.session,
+                self.fmt_desc,
+                &self.state,
+                &vcl_nals,
+                packet,
+                ctr,
+            )?;
             self.pts_counter += 1;
             unsafe { (vt.vt_decomp_finish)(self.session) };
         }
