@@ -410,7 +410,7 @@ fn submit_nal_units(
     session: sys::VTDecompressionSessionRef,
     fmt_desc: sys::CMVideoFormatDescriptionRef,
     nal_units: &[Vec<u8>],
-    pts: Option<i64>,
+    packet: &Packet,
     pts_counter: i64,
 ) -> Result<()> {
     if nal_units.is_empty() {
@@ -476,10 +476,20 @@ fn submit_nal_units(
         return Err(vt_error("CMBlockBufferCreateWithMemoryBlock", status));
     }
 
+    let to_cmtime = |ticks: i64| {
+        CMTime::make(
+            packet
+                .time_base
+                .rescale(ticks, oxideav_core::TimeBase::MICROS),
+            1_000_000,
+        )
+    };
     let timing = CMSampleTimingInfo {
-        duration: CMTime::make(1, 30),
-        presentation_time_stamp: CMTime::make(pts.unwrap_or(pts_counter), 1_000_000),
-        decode_time_stamp: CMTime::invalid(),
+        duration: packet.duration.map_or_else(CMTime::invalid, to_cmtime),
+        presentation_time_stamp: packet
+            .pts
+            .map_or_else(|| CMTime::make(pts_counter, 1_000_000), to_cmtime),
+        decode_time_stamp: packet.dts.map_or_else(CMTime::invalid, to_cmtime),
     };
 
     let mut sample_buf: sys::CMSampleBufferRef = std::ptr::null_mut();
@@ -728,9 +738,8 @@ impl oxideav_core::Decoder for H264VtDecoder {
 
         if !vcl_nals.is_empty() && !self.session.is_null() {
             let vt = sys::vtable().map_err(|e| Error::unsupported(format!("videotoolbox: {e}")))?;
-            let pts = packet.pts;
             let ctr = self.pts_counter;
-            submit_nal_units(vt, self.session, self.fmt_desc, &vcl_nals, pts, ctr)?;
+            submit_nal_units(vt, self.session, self.fmt_desc, &vcl_nals, packet, ctr)?;
             self.pts_counter += 1;
             unsafe { (vt.vt_decomp_finish)(self.session) };
         }
@@ -972,9 +981,8 @@ impl oxideav_core::Decoder for HevcVtDecoder {
 
         if !vcl_nals.is_empty() && !self.session.is_null() {
             let vt = sys::vtable().map_err(|e| Error::unsupported(format!("videotoolbox: {e}")))?;
-            let pts = packet.pts;
             let ctr = self.pts_counter;
-            submit_nal_units(vt, self.session, self.fmt_desc, &vcl_nals, pts, ctr)?;
+            submit_nal_units(vt, self.session, self.fmt_desc, &vcl_nals, packet, ctr)?;
             self.pts_counter += 1;
             unsafe { (vt.vt_decomp_finish)(self.session) };
         }
