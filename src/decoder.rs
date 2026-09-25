@@ -257,6 +257,7 @@ struct CallbackState {
     frames: VecDeque<FrameLease>,
     error: Option<String>,
     timestamp_num: i64,
+    timestamp_den: i64,
 }
 
 impl CallbackState {
@@ -265,6 +266,7 @@ impl CallbackState {
             frames: VecDeque::new(),
             error: None,
             timestamp_num: 1,
+            timestamp_den: 1,
         }))
     }
 }
@@ -320,10 +322,14 @@ unsafe extern "C" fn decomp_callback(
     // the packet's original tick domain before exposing it through OxideAV.
     let pts = if presentation_time_stamp.is_valid() {
         let num = guard.timestamp_num;
-        if num == 0 {
+        let den = guard.timestamp_den;
+        let returned_scale = i64::from(presentation_time_stamp.timescale);
+        if num == 0 || den == 0 || returned_scale <= 0 {
             None
         } else {
-            Some(presentation_time_stamp.value / num)
+            let numerator = i128::from(presentation_time_stamp.value) * i128::from(den);
+            let denominator = i128::from(returned_scale) * i128::from(num);
+            i64::try_from(numerator / denominator).ok()
         }
     } else {
         None
@@ -498,6 +504,7 @@ fn submit_nal_units(
     }
     if let Ok(mut callback_state) = state.lock() {
         callback_state.timestamp_num = time_num;
+        callback_state.timestamp_den = time_den;
     }
     let to_cmtime = |ticks: i64| CMTime::make(ticks.saturating_mul(time_num), time_den as i32);
     let timing = CMSampleTimingInfo {
