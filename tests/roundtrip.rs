@@ -669,6 +669,132 @@ fn feed_h264_packets(
 }
 
 #[test]
+fn h264_reassembles_access_units_split_across_packets() {
+    if oxideav_videotoolbox::sys::vtable().is_err() {
+        eprintln!("VideoToolbox unavailable; skipping split-AU test");
+        return;
+    }
+
+    let width = 320usize;
+    let height = 240usize;
+    let packets = encode_h264_packets(width, height, 0);
+
+    let mut split_packets = Vec::new();
+    for mut packet in packets {
+        // Model the Twitch/MPEG-TS shape: AUD anchors the access unit, while
+        // PES/container packets may divide the AU payload across boundaries.
+        let mut anchored = vec![0, 0, 0, 1, 0x09, 0xf0];
+        anchored.extend_from_slice(&packet.data);
+        packet.data = anchored;
+
+        let split = packet.data.len() / 2;
+        let mut first = packet.clone();
+        first.data = packet.data[..split].to_vec();
+
+        let mut second = packet;
+        second.data = second.data[split..].to_vec();
+
+        split_packets.push(first);
+        split_packets.push(second);
+    }
+
+    let mut p = CodecParameters::video(CodecId::new("h264"));
+    p.width = Some(width as u32);
+    p.height = Some(height as u32);
+    p.pixel_format = Some(PixelFormat::Yuv420P);
+    let mut decoder = vt_decoder::H264VtDecoder::make(&p).expect("decoder construction");
+
+    let mut decoded = feed_h264_packets(&mut decoder, &split_packets);
+    decoder.flush().expect("decoder flush");
+    loop {
+        match decoder.receive_frame() {
+            Ok(Frame::Video(frame)) => decoded.push(frame),
+            Ok(_) => {}
+            Err(Error::NeedMore) | Err(Error::Eof) => break,
+            Err(e) => panic!("receive_frame after flush error: {e}"),
+        }
+    }
+
+    assert!(
+        !decoded.is_empty(),
+        "VideoToolbox decoder produced no frames from split access units"
+    );
+    assert_eq!(decoded[0].planes[0].stride, width);
+}
+
+#[test]
+fn h264_split_pes_access_unit_reassembles_before_decode() {
+    if oxideav_videotoolbox::sys::vtable().is_err() {
+        eprintln!("VideoToolbox unavailable; skipping split-PES H264 test");
+        return;
+    }
+
+    let width = 320usize;
+    let height = 240usize;
+    let encoded = encode_h264_packets(width, height, 90_000);
+    assert!(
+        encoded.len() >= 3,
+        "need at least three encoded access units"
+    );
+
+    const AUD: &[u8] = &[0, 0, 0, 1, 0x09, 0xf0];
+
+    let mut first_au = AUD.to_vec();
+    first_au.extend_from_slice(&encoded[0].data);
+    let split = first_au.len() / 2;
+
+    let mut first_pes = encoded[0].clone();
+    first_pes.data = first_au[..split].to_vec();
+
+    // This PES starts with continuation bytes from the preceding picture,
+    // then begins the next AUD-delimited access unit with its own PTS.
+    let mut second_pes = encoded[1].clone();
+    second_pes.data = first_au[split..].to_vec();
+    second_pes.data.extend_from_slice(AUD);
+    second_pes.data.extend_from_slice(&encoded[1].data);
+
+    // A third AUD closes the second pending AU.
+    let mut third_pes = encoded[2].clone();
+    third_pes.data = AUD.to_vec();
+    third_pes.data.extend_from_slice(&encoded[2].data);
+
+    let mut p = CodecParameters::video(CodecId::new("h264"));
+    p.width = Some(width as u32);
+    p.height = Some(height as u32);
+    p.pixel_format = Some(PixelFormat::Yuv420P);
+    let mut decoder = vt_decoder::H264VtDecoder::make(&p).expect("decoder construction");
+
+    decoder.send_packet(&first_pes).expect("first split PES");
+    assert!(
+        matches!(decoder.receive_frame(), Err(Error::NeedMore)),
+        "incomplete access unit must not be submitted"
+    );
+
+    decoder.send_packet(&second_pes).expect("continuation PES");
+    let first = loop {
+        match decoder.receive_frame() {
+            Ok(Frame::Video(frame)) => break frame,
+            Ok(_) => {}
+            Err(Error::NeedMore) => panic!("reassembled first AU produced no frame"),
+            Err(e) => panic!("reassembled first AU decode failed: {e}"),
+        }
+    };
+    assert_eq!(first.pts, encoded[0].pts);
+    assert_eq!(first.planes[0].stride, width);
+
+    decoder.send_packet(&third_pes).expect("third PES");
+    let second = loop {
+        match decoder.receive_frame() {
+            Ok(Frame::Video(frame)) => break frame,
+            Ok(_) => {}
+            Err(Error::NeedMore) => panic!("second reassembled AU produced no frame"),
+            Err(e) => panic!("second reassembled AU decode failed: {e}"),
+        }
+    };
+    assert_eq!(second.pts, encoded[1].pts);
+}
+
+#[test]
 fn h264_reset_starts_a_fresh_decode_epoch() {
     if oxideav_videotoolbox::sys::vtable().is_err() {
         eprintln!("VideoToolbox unavailable; skipping H264 reset test");

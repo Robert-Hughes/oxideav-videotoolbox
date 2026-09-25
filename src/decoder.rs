@@ -17,6 +17,8 @@ use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 
+use oxideav_h264::access_unit::AnnexBAccessUnitAssembler;
+
 use oxideav_core::{
     CodecId, CodecParameters, Error, Frame, FrameLease, HardwareVideoFrame,
     HardwareVideoFrameStorage, Packet, PixelFormat, Result, VideoFrame, VideoPlane,
@@ -557,6 +559,7 @@ pub struct H264VtDecoder {
     state: Arc<Mutex<CallbackState>>,
     sps_list: Vec<Vec<u8>>,
     pps_list: Vec<Vec<u8>>,
+    au_assembler: AnnexBAccessUnitAssembler,
     output_queue: VecDeque<FrameLease>,
     pts_counter: i64,
     flushed: bool,
@@ -576,6 +579,7 @@ impl H264VtDecoder {
             state: CallbackState::new(),
             sps_list: Vec::new(),
             pps_list: Vec::new(),
+            au_assembler: AnnexBAccessUnitAssembler::default(),
             output_queue: VecDeque::new(),
             pts_counter: 0,
             flushed: false,
@@ -665,43 +669,7 @@ impl H264VtDecoder {
         }
     }
 
-    fn clear_pending_output(&mut self) {
-        self.output_queue.clear();
-        if let Ok(mut state) = self.state.lock() {
-            state.frames.clear();
-            state.error = None;
-        }
-    }
-}
-
-impl Drop for H264VtDecoder {
-    fn drop(&mut self) {
-        self.release_session();
-    }
-}
-
-impl oxideav_core::Decoder for H264VtDecoder {
-    fn codec_id(&self) -> &CodecId {
-        &self.codec_id
-    }
-
-    fn send_packet(&mut self, packet: &Packet) -> Result<()> {
-        self.flushed = false;
-
-        // Surface (and clear) any error the async callback recorded since
-        // the last call. `take()` keeps one bad frame from latching the
-        // session into a permanent error state — VT decode errors are
-        // per-frame, and the session remains usable for the next access
-        // unit.
-        if let Some(e) = self
-            .state
-            .lock()
-            .ok()
-            .and_then(|mut g| g.error.take().map(Error::other))
-        {
-            return Err(e);
-        }
-
+    fn process_access_unit(&mut self, packet: &Packet) -> Result<()> {
         let mut vcl_nals: Vec<Vec<u8>> = Vec::new();
         let mut params_changed = false;
 
@@ -741,10 +709,51 @@ impl oxideav_core::Decoder for H264VtDecoder {
             let ctr = self.pts_counter;
             submit_nal_units(vt, self.session, self.fmt_desc, &vcl_nals, packet, ctr)?;
             self.pts_counter += 1;
-            unsafe { (vt.vt_decomp_finish)(self.session) };
         }
 
         self.pull_frames();
+        Ok(())
+    }
+
+    fn clear_pending_output(&mut self) {
+        self.output_queue.clear();
+        if let Ok(mut state) = self.state.lock() {
+            state.frames.clear();
+            state.error = None;
+        }
+    }
+}
+
+impl Drop for H264VtDecoder {
+    fn drop(&mut self) {
+        self.release_session();
+    }
+}
+
+impl oxideav_core::Decoder for H264VtDecoder {
+    fn codec_id(&self) -> &CodecId {
+        &self.codec_id
+    }
+
+    fn send_packet(&mut self, packet: &Packet) -> Result<()> {
+        self.flushed = false;
+
+        if let Some(e) = self
+            .state
+            .lock()
+            .ok()
+            .and_then(|mut g| g.error.take().map(Error::other))
+        {
+            return Err(e);
+        }
+
+        // Container/PES packet boundaries are not H.264 access-unit boundaries.
+        // Reassemble AUD-delimited Annex-B access units before handing them to
+        // VideoToolbox, matching the other OxideAV hardware backends.
+        let completed = self.au_assembler.push(packet)?;
+        for access_unit in completed {
+            self.process_access_unit(&access_unit)?;
+        }
         Ok(())
     }
 
@@ -764,6 +773,9 @@ impl oxideav_core::Decoder for H264VtDecoder {
     }
 
     fn flush(&mut self) -> Result<()> {
+        if let Some(access_unit) = self.au_assembler.flush() {
+            self.process_access_unit(&access_unit)?;
+        }
         if !self.session.is_null() {
             if let Ok(vt) = sys::vtable() {
                 unsafe { (vt.vt_decomp_finish)(self.session) };
@@ -778,6 +790,7 @@ impl oxideav_core::Decoder for H264VtDecoder {
         // Flush is an end-of-stream drain; a seek starts a new decode epoch.
         // Retain the parameter sets, but discard the old VT session and all
         // queued output so reference pictures cannot cross the discontinuity.
+        self.au_assembler.reset();
         self.release_session();
         self.clear_pending_output();
         self.pts_counter = 0;

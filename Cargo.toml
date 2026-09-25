@@ -17,6 +17,7 @@ categories = ["multimedia::encoding", "multimedia::video", "hardware-support"]
 # tooling consumers can depend on `oxideav-videotoolbox` with
 # `default-features = false` and avoid the framework dependency tree.
 oxideav-core = { version = "0.1", optional = true }
+oxideav-h264 = { git = "https://github.com/Robert-Hughes/oxideav-h264.git", branch = "dev", optional = true }
 
 # libloading is pulled on macOS + iOS targets — every non-Apple-platform
 # build ships a stub `register()` that's a no-op (the crate body itself
@@ -31,4 +32,4 @@ default = ["registry"]
 # `oxideav-core` so the crate can plug into the `oxideav` framework
 # registry. Default-on; turn off for tooling that just wants the raw
 # VideoToolbox bridge bindings without the framework.
-registry = ["dep:oxideav-core"]
+registry = ["dep:oxideav-core", "dep:oxideav-h264"]
